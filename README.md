@@ -1,6 +1,6 @@
 # ROS2 Turtlesim Project
 
-This project demonstrates how to use the `turtlesim` package in ROS2 Humble to control a turtle using both keyboard input and command-line topic publishing. It runs inside a Docker container on macOS (Apple Silicon) with GUI forwarding through XQuartz.
+This project demonstrates how to use the `turtlesim` package in ROS2 Humble to control a turtle using both keyboard input and command-line topic publishing. It also includes a custom ROS2 node (`turtle_magic`) that drives the turtle in a square when triggered by a service call. Everything runs inside a Docker container on macOS (Apple Silicon) with GUI forwarding through XQuartz.
 
 ---
 
@@ -11,6 +11,7 @@ This project demonstrates how to use the `turtlesim` package in ROS2 Humble to c
 - List active ROS2 topics
 - Change the background color using parameters
 - Move the turtle in a continuous circle using command-line topic publishing
+- Write a custom ROS2 publisher/service node that draws a square path on demand
 
 ---
 
@@ -106,3 +107,64 @@ ros2 topic pub /turtle1/cmd_vel geometry_msgs/msg/Twist "{linear: {x: 2.0}, angu
 ```
 
 This publishes a velocity command directly to the turtle, sending it in a continuous circle without any keyboard input.
+
+---
+
+## The Magic Button
+
+The `turtle_magic` package contains a custom ROS2 node called `path_drawer`. It advertises a service called `/draw_path`. Calling that service is the "magic button" -- the turtle immediately drives itself in a square and stops when it is done.
+
+Internally, the node uses:
+- A **publisher** on `/turtle1/cmd_vel` to send `Twist` velocity messages
+- A **service server** on `/draw_path` using `std_srvs/srv/Trigger`
+- A timed control loop that alternates between moving forward and turning 90 degrees, four times
+
+### Build the image (includes the package)
+
+```bash
+docker build -t ros2-humble-turtlesim .
+```
+
+Colcon builds the `turtle_magic` package automatically during the image build.
+
+### Run turtlesim
+
+```bash
+open -a XQuartz && xhost + 127.0.0.1
+
+docker run -d \
+  --name ros2_turtlesim \
+  -e DISPLAY=host.docker.internal:0 \
+  -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
+  ros2-humble-turtlesim \
+  bash -c "source /opt/ros/humble/setup.bash && source /ros2_ws/install/setup.bash && ros2 run turtlesim turtlesim_node"
+```
+
+### Reset the turtle to center (so the square fits on screen)
+
+```bash
+docker exec ros2_turtlesim bash -c \
+  "source /opt/ros/humble/setup.bash && ros2 service call /reset std_srvs/srv/Empty"
+```
+
+### Start the path_drawer node (in a separate terminal)
+
+```bash
+docker exec -it ros2_turtlesim bash -c \
+  "source /opt/ros/humble/setup.bash && source /ros2_ws/install/setup.bash && ros2 run turtle_magic path_drawer"
+```
+
+You will see: `PathDrawer ready. Call /draw_path to draw a square.`
+
+### Press the magic button (in another terminal)
+
+```bash
+docker exec ros2_turtlesim bash -c \
+  "source /opt/ros/humble/setup.bash && ros2 service call /draw_path std_srvs/srv/Trigger"
+```
+
+The turtle will draw a square (about 14 seconds). The service returns:
+
+```
+response: std_srvs.srv.Trigger_Response(success=True, message='Square complete!')
+```
