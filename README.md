@@ -168,4 +168,5 @@ The turtle will draw a square (about 14 seconds). The service returns:
 ```
 response: std_srvs.srv.Trigger_Response(success=True, message='Square complete!')
 ```
-<img width="503" height="530" alt="image" src="https://github.com/user-attachments/assets/3367524b-af6e-4bf0-ba53-3784881d5f67" />
+<img width="791" height="824" alt="image" src="https://github.com/user-attachments/assets/defb19af-3f59-477f-8504-bb932e167223" />
+
