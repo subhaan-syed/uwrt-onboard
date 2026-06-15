@@ -117,7 +117,9 @@ The `turtle_magic` package contains a custom ROS2 node called `path_drawer`. It 
 Internally, the node uses:
 - A **publisher** on `/turtle1/cmd_vel` to send `Twist` velocity messages
 - A **service server** on `/draw_path` using `std_srvs/srv/Trigger`
-- A timed control loop that alternates between moving forward and turning 90 degrees, four times
+- A **ROS2 timer** firing at 10 Hz that drives a state machine (IDLE, MOVING, TURNING, DONE)
+
+The service callback returns immediately -- it just flips the state machine from IDLE to MOVING and returns. The timer then takes over, publishing the right velocity on each tick and handling transitions between states. This keeps the ROS2 executor fully responsive while the turtle is moving: `ros2 topic list`, `ros2 service list`, and any other commands continue to work normally during the square. Using `time.sleep()` in a callback instead would freeze the executor for the entire duration.
 
 ### Build the image (includes the package)
 
@@ -163,10 +165,11 @@ docker exec ros2_turtlesim bash -c \
   "source /opt/ros/humble/setup.bash && ros2 service call /draw_path std_srvs/srv/Trigger"
 ```
 
-The turtle will draw a square (about 14 seconds). The service returns:
+The service returns immediately:
 
 ```
-response: std_srvs.srv.Trigger_Response(success=True, message='Square complete!')
+response: std_srvs.srv.Trigger_Response(success=True, message='Square path started.')
 ```
 <img width="791" height="824" alt="image" src="https://github.com/user-attachments/assets/defb19af-3f59-477f-8504-bb932e167223" />
 
+The turtle then draws the square over the next 14 seconds. Watch the path_drawer terminal for side-by-side progress logs.

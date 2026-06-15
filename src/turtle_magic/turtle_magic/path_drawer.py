@@ -5,12 +5,23 @@
 # triggered, it drives the turtle in a square by publishing velocity commands.
 #
 # Core ROS2 concepts used here:
-#   Publisher  - sends messages on a topic (we publish Twist to /turtle1/cmd_vel)
-#   Service    - a request/response mechanism (we advertise /draw_path)
-#   Twist msg  - the standard ROS2 type for velocity: linear (x/y/z) and angular (x/y/z)
+#   Publisher    - sends messages on a topic (we publish Twist to /turtle1/cmd_vel)
+#   Service      - a request/response mechanism (we advertise /draw_path)
+#   Timer        - calls a function at a fixed rate (drives our motion loop at 10 Hz)
+#   State machine - tracks which phase of the square we are in
+#   Twist msg    - the standard ROS2 type for velocity: linear (x/y/z) and angular (x/y/z)
+#
+# WHY a timer instead of time.sleep():
+#   The ROS2 executor is single-threaded by default. Calling time.sleep() inside a
+#   callback (like a service callback) freezes the executor for the entire sleep
+#   duration -- no other callbacks, timers, or service calls can be processed.
+#   On a real robot this would mean missed sensor data and an unresponsive system.
+#   Using create_timer() instead lets the executor continue running normally while
+#   the turtle moves: the timer fires every 0.1 s, checks the current state, and
+#   publishes the appropriate velocity command for that tick only.
 
 import math
-import time
+from enum import Enum, auto
 
 import rclpy
 from rclpy.node import Node
@@ -29,9 +40,20 @@ SIDE_DURATION = 2.0
 # pi/2 rad/s means one full 90-degree turn takes exactly 1 second.
 ANGULAR_SPEED = math.pi / 2
 
-# How long to turn for each corner (seconds)
+# How long to turn at each corner (seconds)
 # Angle turned = ANGULAR_SPEED * TURN_DURATION = (pi/2) * 1.0 = pi/2 rad = 90 degrees
 TURN_DURATION = 1.0
+
+# How often the control timer fires (seconds). 10 Hz = 0.1 s per tick.
+TIMER_PERIOD = 0.1
+
+
+class State(Enum):
+    """The four phases of the square-drawing sequence."""
+    IDLE    = auto()   # waiting for a service call, timer does nothing
+    MOVING  = auto()   # driving forward along one side
+    TURNING = auto()   # rotating 90 degrees at a corner
+    DONE    = auto()   # all four sides finished, send a stop command then go IDLE
 
 
 class PathDrawer(Node):
@@ -42,9 +64,7 @@ class PathDrawer(Node):
         super().__init__('path_drawer')
 
         # Create a publisher on the /turtle1/cmd_vel topic.
-        # The second argument is the message type (Twist).
-        # The third argument (10) is the queue size -- how many messages to
-        # buffer if the subscriber is slow.
+        # Queue size 10 means up to 10 messages can wait if the subscriber is slow.
         self.publisher = self.create_publisher(Twist, '/turtle1/cmd_vel', 10)
 
         # Advertise the /draw_path service using the Trigger service type.
@@ -54,71 +74,110 @@ class PathDrawer(Node):
             Trigger, 'draw_path', self.draw_path_callback
         )
 
+        # The control timer drives the state machine at 10 Hz.
+        # It fires every TIMER_PERIOD seconds regardless of what else the node is doing.
+        self.timer = self.create_timer(TIMER_PERIOD, self.timer_callback)
+
+        # State machine variables.
+        self.state = State.IDLE
+        self.side_count = 0          # how many sides (and turns) have been completed
+        self.state_start_time = None # ROS2 clock time when the current state began
+
         self.get_logger().info('PathDrawer ready. Call /draw_path to draw a square.')
 
-    def publish_velocity(self, linear_x, angular_z, duration):
-        """
-        Publish a constant velocity command for a fixed amount of time, then stop.
-
-        linear_x  -- forward/backward speed (positive = forward)
-        angular_z -- rotation speed in rad/s (positive = counter-clockwise / left turn)
-        duration  -- how many seconds to keep publishing this command
-        """
-        msg = Twist()
-        msg.linear.x = linear_x
-        msg.angular.z = angular_z
-
-        # Send the command repeatedly at ~10 Hz for the full duration.
-        # Publishing once and waiting would work too, but looping at 10 Hz
-        # is more realistic and keeps the turtle moving smoothly.
-        end_time = time.time() + duration
-        while time.time() < end_time:
-            self.publisher.publish(msg)
-            time.sleep(0.1)
-
-        # Send a zero-velocity message to bring the turtle to a full stop
-        # before the next motion segment begins.
-        self.publisher.publish(Twist())
-        time.sleep(0.2)
+    # -------------------------------------------------------------------------
+    # Service callback
+    # -------------------------------------------------------------------------
 
     def draw_path_callback(self, request, response):
         """
-        Service callback -- runs when /draw_path is called.
+        Called when /draw_path is triggered (the "magic button press").
 
-        Drives the turtle in a square:
-          - Move forward 3 units (1.5 m/s for 2 s)
-          - Turn left 90 degrees (pi/2 rad/s for 1 s)
-          - Repeat 4 times to close the square
-
-        The square fits comfortably inside the turtlesim window as long as
-        the turtle starts near the center. Call /reset before this service
-        to guarantee a clean starting position.
+        This callback returns IMMEDIATELY -- it does not wait for the turtle to
+        finish. Instead it kicks off the state machine and lets the timer do
+        the actual motion work. This keeps the executor fully responsive.
         """
+        if self.state != State.IDLE:
+            # Reject the call if a path is already in progress.
+            response.success = False
+            response.message = 'Already drawing a path, please wait.'
+            return response
+
+        # Start the sequence: first phase is MOVING (driving forward).
+        self.side_count = 0
+        self.state_start_time = self.get_clock().now()
+        self.state = State.MOVING
         self.get_logger().info('Starting square path...')
 
-        for side in range(4):
-            self.get_logger().info(f'Side {side + 1} of 4')
-
-            # Drive forward along one side of the square
-            self.publish_velocity(LINEAR_SPEED, 0.0, SIDE_DURATION)
-
-            # Turn left 90 degrees to face the next side
-            self.publish_velocity(0.0, ANGULAR_SPEED, TURN_DURATION)
-
-        self.get_logger().info('Square complete!')
-
-        # Fill in the service response
+        # Return immediately. The timer will handle all the actual movement.
         response.success = True
-        response.message = 'Square complete!'
+        response.message = 'Square path started.'
         return response
+
+    # -------------------------------------------------------------------------
+    # Timer callback -- the state machine
+    # -------------------------------------------------------------------------
+
+    def timer_callback(self):
+        """
+        Fires every 0.1 seconds. Checks the current state, publishes the
+        appropriate velocity, and handles transitions between states.
+
+        The flow for one complete square:
+            IDLE -> MOVING -> TURNING -> MOVING -> TURNING -> ... (x4) -> DONE -> IDLE
+        """
+        if self.state == State.IDLE:
+            # Nothing to do while waiting for a service call.
+            return
+
+        # How many seconds have passed since the current state started.
+        elapsed = (self.get_clock().now() - self.state_start_time).nanoseconds / 1e9
+
+        if self.state == State.MOVING:
+            # Publish a forward velocity command for this tick.
+            msg = Twist()
+            msg.linear.x = LINEAR_SPEED
+            self.publisher.publish(msg)
+
+            # If we have been moving long enough to cover one side, switch to turning.
+            if elapsed >= SIDE_DURATION:
+                self.side_count += 1
+                self.get_logger().info(f'Side {self.side_count} complete, turning...')
+                self._enter_state(State.TURNING)
+
+        elif self.state == State.TURNING:
+            # Publish a left-turn velocity command for this tick.
+            msg = Twist()
+            msg.angular.z = ANGULAR_SPEED
+            self.publisher.publish(msg)
+
+            # If we have turned long enough for 90 degrees, move to the next phase.
+            if elapsed >= TURN_DURATION:
+                if self.side_count >= 4:
+                    # All four sides and turns are done.
+                    self._enter_state(State.DONE)
+                else:
+                    self.get_logger().info(f'Turn complete, starting side {self.side_count + 1}...')
+                    self._enter_state(State.MOVING)
+
+        elif self.state == State.DONE:
+            # Send a zero-velocity stop command, then go back to IDLE.
+            self.publisher.publish(Twist())
+            self.state = State.IDLE
+            self.get_logger().info('Square complete!')
+
+    def _enter_state(self, new_state):
+        """Transition to a new state and record when it started."""
+        self.state = new_state
+        self.state_start_time = self.get_clock().now()
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = PathDrawer()
 
-    # spin() keeps the node alive and processes incoming service calls.
-    # Without this, the node would exit immediately.
+    # spin() keeps the node alive and hands control to the executor.
+    # The executor processes timer callbacks and incoming service calls.
     rclpy.spin(node)
 
     rclpy.shutdown()
